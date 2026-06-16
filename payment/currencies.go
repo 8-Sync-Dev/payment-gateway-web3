@@ -3,19 +3,16 @@ package payment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
+
+	"encore.dev/storage/cache"
 )
 
-type CurrencyInfo struct {
-	Ccy      string `json:"ccy"`
-	Name     string `json:"name"`
-	Chain    string `json:"chain"`
-	MinDep   string `json:"minDep"`
-	LogoLink string `json:"logoLink"`
-}
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 type GetCurrenciesResponse struct {
 	Currencies []CurrencyInfo `json:"currencies"`
@@ -34,8 +31,7 @@ type OKXCurrenciesResponse struct {
 	} `json:"data"`
 }
 
-//encore:api public method=GET path=/payment/currencies
-func GetCurrencies(ctx context.Context) (*GetCurrenciesResponse, error) {
+func fetchOKXCurrencies(ctx context.Context) ([]CurrencyInfo, error) {
 	requestPath := "/api/v5/asset/currencies"
 	fullURL := "https://openapi.okx.com" + requestPath
 
@@ -45,27 +41,23 @@ func GetCurrencies(ctx context.Context) (*GetCurrenciesResponse, error) {
 	}
 
 	timestamp := GenerateOKXTimestamp()
-	method := "GET"
-	bodyStr := ""
-
-	apiKey := secrets.OKXApiKey
-	secretKey := secrets.OKXSecretKey
-	passphrase := secrets.OKXPassphrase
-
-	sign := GenerateOKXSignature(timestamp, method, requestPath, bodyStr, secretKey)
+	sign := GenerateOKXSignature(timestamp, http.MethodGet, requestPath, "", secrets.OKXSecretKey)
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("OK-ACCESS-KEY", apiKey)
-	httpReq.Header.Set("OK-ACCESS-PASSPHRASE", passphrase)
+	httpReq.Header.Set("OK-ACCESS-KEY", secrets.OKXApiKey)
+	httpReq.Header.Set("OK-ACCESS-PASSPHRASE", secrets.OKXPassphrase)
 	httpReq.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
 	httpReq.Header.Set("OK-ACCESS-SIGN", sign)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	httpResp, err := client.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("okx api request failed: %w", err)
 	}
 	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("okx api returned non-200 status: %d", httpResp.StatusCode)
+	}
 
 	bodyBytes, err := io.ReadAll(httpResp.Body)
 	if err != nil {
@@ -74,14 +66,14 @@ func GetCurrencies(ctx context.Context) (*GetCurrenciesResponse, error) {
 
 	var okxResp OKXCurrenciesResponse
 	if err := json.Unmarshal(bodyBytes, &okxResp); err != nil {
-		return nil, fmt.Errorf("failed to parse okx response: %w, body: %s", err, string(bodyBytes))
+		return nil, fmt.Errorf("failed to parse okx response: %w", err)
 	}
 
 	if okxResp.Code != "0" {
 		return nil, fmt.Errorf("okx returned error: code=%s, msg=%s", okxResp.Code, okxResp.Msg)
 	}
 
-	var result []CurrencyInfo
+	result := make([]CurrencyInfo, 0, len(okxResp.Data))
 	for _, c := range okxResp.Data {
 		if c.CanDep {
 			result = append(result, CurrencyInfo{
@@ -94,7 +86,51 @@ func GetCurrencies(ctx context.Context) (*GetCurrenciesResponse, error) {
 		}
 	}
 
-	return &GetCurrenciesResponse{
-		Currencies: result,
-	}, nil
+	return result, nil
+}
+
+func syncSupportedCurrenciesCache(ctx context.Context) ([]CurrencyInfo, error) {
+	currencies, err := fetchOKXCurrencies(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	payload := CachedCurrencies{Currencies: currencies}
+	if err := SupportedCurrenciesCache.Set(ctx, supportedCurrenciesCacheKey, payload); err != nil {
+		return nil, fmt.Errorf("failed to save currencies to cache: %w", err)
+	}
+
+	return currencies, nil
+}
+
+func getCachedCurrencies(ctx context.Context) ([]CurrencyInfo, error) {
+	payload, err := SupportedCurrenciesCache.Get(ctx, supportedCurrenciesCacheKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return payload.Currencies, nil
+}
+
+//encore:api public method=GET path=/payment/currencies
+func GetCurrencies(ctx context.Context) (*GetCurrenciesResponse, error) {
+	currencies, err := getCachedCurrencies(ctx)
+	if err == nil {
+		return &GetCurrenciesResponse{Currencies: currencies}, nil
+	}
+
+	if errors.Is(err, cache.Miss) {
+		currencies, err = syncSupportedCurrenciesCache(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &GetCurrenciesResponse{Currencies: currencies}, nil
+	}
+
+	currencies, syncErr := syncSupportedCurrenciesCache(ctx)
+	if syncErr != nil {
+		return nil, fmt.Errorf("failed to read currencies from cache: %w", err)
+	}
+
+	return &GetCurrenciesResponse{Currencies: currencies}, nil
 }
