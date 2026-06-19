@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"math"
 
 	"encore.app/payment/cacheadapter"
 	"encore.app/payment/domain"
@@ -20,21 +19,22 @@ import (
 
 	"encore.dev/cron"
 	"encore.dev/rlog"
+	"github.com/shopspring/decimal"
 )
 
 type CheckoutRequest struct {
-	UserID   string  `json:"user_id"`
-	Amount   float64 `json:"amount"`
-	Currency string  `json:"currency"`
-	Chain    string  `json:"chain"`
+	UserID   string          `json:"user_id"`
+	Amount   decimal.Decimal `json:"amount"`
+	Currency string          `json:"currency"`
+	Chain    string          `json:"chain"`
 }
 
 type CheckoutResponse struct {
-	OrderID        string  `json:"order_id"`
-	DepositAddress string  `json:"deposit_address"`
-	Amount         float64 `json:"amount"`
-	Currency       string  `json:"currency"`
-	Status         string  `json:"status"`
+	OrderID        string          `json:"order_id"`
+	DepositAddress string          `json:"deposit_address"`
+	Amount         decimal.Decimal `json:"amount"`
+	Currency       string          `json:"currency"`
+	Status         string          `json:"status"`
 }
 
 type GetCurrenciesResponse struct {
@@ -191,27 +191,27 @@ func (s *Service) runDepositListener() {
 
 // dedupAmount keeps amounts unique among pending orders. NOTE: still has
 // SELECT-then-INSERT race (trace error.md C1).
-func (s *Service) dedupAmount(ctx context.Context, ccy string, base float64) (float64, error) {
+func (s *Service) dedupAmount(ctx context.Context, ccy string, base decimal.Decimal) (decimal.Decimal, error) {
 	const maxRetries = 10
 	amount := base
 	for i := 0; i < maxRetries; i++ {
 		exists, err := s.repo.HasPendingAmount(ctx, ccy, amount)
 		if err != nil {
-			return 0, err
+			return decimal.Zero, err
 		}
 		if !exists {
 			return amount, nil
 		}
 		if i == maxRetries-1 {
-			return 0, errors.New("system busy, please try again later")
+			return decimal.Zero, errors.New("system busy, please try again later")
 		}
 		b := make([]byte, 2)
 		if _, err := rand.Read(b); err != nil {
-			return 0, err
+			return decimal.Zero, err
 		}
 		val := uint16(b[0])<<8 | uint16(b[1])
-		offset := float64((val%999)+1) / 10000.0
-		amount = math.Round((base+offset)*10000) / 10000
+		offset := decimal.New(int64((val%999)+1), -4) // offsetInt × 10^-4, exact
+		amount = base.Add(offset).Round(4)
 	}
 	return amount, nil
 }

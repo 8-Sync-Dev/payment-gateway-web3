@@ -10,6 +10,7 @@ import (
 	"encore.dev/rlog"
 
 	"github.com/gorilla/websocket"
+	"github.com/shopspring/decimal"
 )
 
 type wsSubscriber struct {
@@ -126,17 +127,20 @@ func (s *wsSubscriber) loginAndSubscribe(ctx context.Context, c *websocket.Conn)
 func toDomainDeposit(d wsDeposit) domain.Deposit {
 	return domain.Deposit{
 		Ccy:   d.Ccy,
-		Amt:   parseFloat(d.Amt),
+		Amt:   parseDecimal(d.Amt),
 		State: d.State,
 		TxID:  d.TxID,
 		Time:  parseMillis(d.Ts),
 	}
 }
 
-func parseFloat(s string) float64 {
-	var f float64
-	_ = json.Unmarshal([]byte(s), &f)
-	return f
+func parseDecimal(s string) decimal.Decimal {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		rlog.Warn("okx ws: failed to parse amount", "raw", s, "err", err)
+		return decimal.Zero
+	}
+	return d
 }
 
 func parseMillis(s string) time.Time {

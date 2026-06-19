@@ -5,6 +5,8 @@ package domain
 import (
 	"errors"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // Transaction maps 1:1 to the `transactions` table.
@@ -12,12 +14,12 @@ type Transaction struct {
 	ID             string
 	UserID         string
 	OrderID        string
-	Amount         float64
+	Amount         decimal.Decimal
 	Currency       string
 	DepositAddress string
 	Status         string // StatusPending | StatusSuccess | StatusExpired
 	TxID           string // on-chain tx hash, set when matched
-	ReceivedAmount float64
+	ReceivedAmount decimal.Decimal
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -32,7 +34,7 @@ const (
 // provider-specific push events (OKX, Binance, on-chain).
 type Deposit struct {
 	Ccy   string
-	Amt   float64
+	Amt   decimal.Decimal
 	State string // provider-specific; "2" = finalized on OKX
 	TxID  string
 	Time  time.Time

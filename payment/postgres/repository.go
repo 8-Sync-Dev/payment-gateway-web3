@@ -6,6 +6,7 @@ import (
 
 	"encore.app/payment/domain"
 	"encore.dev/storage/sqldb"
+	"github.com/shopspring/decimal"
 )
 
 var _ domain.Repository = (*Repository)(nil)
@@ -26,7 +27,7 @@ func (r *Repository) CreateTransaction(ctx context.Context, tx *domain.Transacti
 	return err
 }
 
-func (r *Repository) HasPendingAmount(ctx context.Context, ccy string, amount float64) (bool, error) {
+func (r *Repository) HasPendingAmount(ctx context.Context, ccy string, amount decimal.Decimal) (bool, error) {
 	var exists bool
 	err := r.db.QueryRow(ctx, `
 		SELECT EXISTS(
@@ -69,7 +70,7 @@ func (r *Repository) ListPendingForDeposit(ctx context.Context, ccy string, sinc
 
 // MarkSuccess returns rowsAffected. The WHERE status='pending' guard makes the
 // UPDATE atomic against concurrent matchers — 0 means another matcher won.
-func (r *Repository) MarkSuccess(ctx context.Context, id string, receivedAmount float64, txHash string) (int64, error) {
+func (r *Repository) MarkSuccess(ctx context.Context, id string, receivedAmount decimal.Decimal, txHash string) (int64, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE transactions
 		SET status = 'success', received_amount = $1, tx_id = $2, updated_at = NOW()

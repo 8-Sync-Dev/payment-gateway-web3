@@ -3,19 +3,22 @@
 package matcher
 
 import (
-	"math"
 	"time"
 
 	"encore.app/payment/domain"
+	"github.com/shopspring/decimal"
 )
 
 type Config struct {
-	AllowedMargin float64       // max |orderAmount - depositAmount| to qualify
-	TimeWindow    time.Duration // how far back from deposit time to look
+	AllowedMargin decimal.Decimal // max |orderAmount - depositAmount| to qualify
+	TimeWindow    time.Duration   // how far back from deposit time to look
 }
 
 func Default() Config {
-	return Config{AllowedMargin: 0.1, TimeWindow: 2 * time.Hour}
+	return Config{
+		AllowedMargin: decimal.RequireFromString("0.1"),
+		TimeWindow:    2 * time.Hour,
+	}
 }
 
 type Matcher struct {
@@ -30,20 +33,20 @@ func New(cfg Config) *Matcher {
 // AllowedMargin, tie-broken by smallest time gap. Returns nil if none qualify.
 // Caller must still call Repository.MarkSuccess and check rowsAffected.
 func (m *Matcher) FindBestMatch(deposit domain.Deposit, candidates []*domain.Transaction) *domain.Transaction {
-	bestScore := math.MaxFloat64
 	var best *domain.Transaction
-	var bestTimeGap time.Duration = math.MaxInt64
+	var bestScore decimal.Decimal
+	var bestTimeGap time.Duration
 
 	for _, tx := range candidates {
-		diff := math.Abs(tx.Amount - deposit.Amt)
-		if diff > m.cfg.AllowedMargin {
+		diff := tx.Amount.Sub(deposit.Amt).Abs()
+		if diff.GreaterThan(m.cfg.AllowedMargin) {
 			continue
 		}
 		gap := deposit.Time.Sub(tx.CreatedAt)
 		if gap < 0 {
 			gap = -gap
 		}
-		if diff < bestScore || (diff == bestScore && gap < bestTimeGap) {
+		if best == nil || diff.LessThan(bestScore) || (diff.Equal(bestScore) && gap < bestTimeGap) {
 			bestScore = diff
 			bestTimeGap = gap
 			best = tx

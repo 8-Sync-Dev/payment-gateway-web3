@@ -3,9 +3,10 @@ package domain
 import (
 	"context"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
-// DepositHandler is invoked by a Provider for each detected deposit.
 // Must be idempotent — providers may redeliver the same deposit on reconnect.
 type DepositHandler func(ctx context.Context, deposit Deposit) error
 
@@ -25,13 +26,13 @@ type Provider interface {
 type Repository interface {
 	CreateTransaction(ctx context.Context, tx *Transaction) error
 	// HasPendingAmount — deposit fingerprint dedup at checkout.
-	HasPendingAmount(ctx context.Context, ccy string, amount float64) (bool, error)
+	HasPendingAmount(ctx context.Context, ccy string, amount decimal.Decimal) (bool, error)
 	// HasTxHash — deposit idempotency (WS at-least-once delivery).
 	HasTxHash(ctx context.Context, txHash string) (bool, error)
 	ListPendingForDeposit(ctx context.Context, ccy string, since time.Time) ([]*Transaction, error)
 	// MarkSuccess returns rowsAffected — caller MUST check; 0 means a
 	// concurrent matcher won this order.
-	MarkSuccess(ctx context.Context, id string, receivedAmount float64, txHash string) (int64, error)
+	MarkSuccess(ctx context.Context, id string, receivedAmount decimal.Decimal, txHash string) (int64, error)
 }
 
 type CurrencyCache interface {
