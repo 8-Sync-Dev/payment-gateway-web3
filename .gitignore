@@ -2,5 +2,6 @@
 encore.gen.go
 encore.gen.cue
 /encore.gen
-.encore.app
+encore.app
 /.encore
+trace error.md
