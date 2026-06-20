@@ -5,3 +5,4 @@ encore.gen.cue
 encore.app
 /.encore
 trace error.md
+.idea
