@@ -3,4 +3,5 @@ encore.gen.go
 encore.gen.cue
 /encore.gen
 .encore.app
+encore.app
 /.idea
