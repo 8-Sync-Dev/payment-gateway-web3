@@ -6,3 +6,4 @@ encore.app
 /.encore
 trace error.md
 .idea
+.DS_Store
