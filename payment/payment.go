@@ -41,6 +41,15 @@ type GetCurrenciesResponse struct {
 	Currencies []domain.Currency `json:"currencies"`
 }
 
+type ListExceptionsResponse struct {
+	Exceptions []*domain.MatchException `json:"exceptions"`
+}
+
+type ResolveExceptionRequest struct {
+	ID         int64  `json:"id"`
+	Resolution string `json:"resolution"`
+}
+
 // svc is set by initService; read by package-level cron wrappers.
 var svc *Service
 
@@ -89,19 +98,31 @@ func (s *Service) Checkout(ctx context.Context, req *CheckoutRequest) (*Checkout
 		return nil, err
 	}
 
-	finalAmount, err := s.dedupAmount(ctx, req.Currency, req.Amount)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.repo.CreateTransaction(ctx, &domain.Transaction{
-		UserID:         req.UserID,
-		OrderID:        orderID,
-		Amount:         finalAmount,
-		Currency:       req.Currency,
-		DepositAddress: addr.Addr,
-	}); err != nil {
-		return nil, err
+	const maxRetries = 10
+	var finalAmount decimal.Decimal
+	for i := 0; i < maxRetries; i++ {
+		amount, err := s.dedupAmount(ctx, req.Currency, req.Amount)
+		if err != nil {
+			return nil, err
+		}
+		inserted, err := s.repo.CreateTransaction(ctx, &domain.Transaction{
+			UserID:         req.UserID,
+			OrderID:        orderID,
+			Amount:         amount,
+			Currency:       req.Currency,
+			DepositAddress: addr.Addr,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if inserted {
+			finalAmount = amount
+			break
+		}
+		if i == maxRetries-1 {
+			return nil, errors.New("system busy, please try again later")
+		}
+		// (currency, amount) taken between dedup and insert — retry with a fresh offset.
 	}
 
 	return &CheckoutResponse{
@@ -142,18 +163,21 @@ func (s *Service) SyncCurrencies(ctx context.Context) error {
 	return s.cache.Set(ctx, currencies)
 }
 
-// handleDeposit is idempotent — WS at-least-once delivery may redeliver.
+// handleDeposit records every finalized deposit into the immutable ledger,
+// then matches by exact amount. Deposits with no exact-amount order, or that
+// lose a claim race, are routed to the review queue instead of being dropped.
+// Idempotent on tx_id (ledger ON CONFLICT DO NOTHING).
 func (s *Service) handleDeposit(ctx context.Context, deposit domain.Deposit) error {
 	if deposit.State != "2" {
 		return nil
 	}
 
-	seen, err := s.repo.HasTxHash(ctx, deposit.TxID)
+	inserted, err := s.repo.RecordDeposit(ctx, &deposit)
 	if err != nil {
 		return err
 	}
-	if seen {
-		return nil
+	if !inserted {
+		return nil // already processed
 	}
 
 	candidates, err := s.repo.ListPendingForDeposit(ctx, deposit.Ccy, s.matcher.Since(deposit.Time))
@@ -163,7 +187,16 @@ func (s *Service) handleDeposit(ctx context.Context, deposit domain.Deposit) err
 
 	best := s.matcher.FindBestMatch(deposit, candidates)
 	if best == nil {
-		rlog.Warn("no matching order for deposit",
+		if err := s.repo.CreateMatchException(ctx, &domain.MatchException{
+			DepositTxID: deposit.TxID,
+			Ccy:         deposit.Ccy,
+			Amt:         deposit.Amt,
+			Reason:      domain.ExceptionNoExactMatch,
+			Candidates:  toExceptionCandidates(candidates),
+		}); err != nil {
+			rlog.Error("failed to record no-match exception", "err", err, "tx_id", deposit.TxID)
+		}
+		rlog.Warn("deposit has no exact-amount order",
 			"amount", deposit.Amt, "ccy", deposit.Ccy, "tx_id", deposit.TxID)
 		return nil
 	}
@@ -173,14 +206,38 @@ func (s *Service) handleDeposit(ctx context.Context, deposit domain.Deposit) err
 		return err
 	}
 	if rows == 0 {
+		if err := s.repo.CreateMatchException(ctx, &domain.MatchException{
+			DepositTxID: deposit.TxID,
+			Ccy:         deposit.Ccy,
+			Amt:         deposit.Amt,
+			Reason:      domain.ExceptionRaceLost,
+			Candidates:  toExceptionCandidates(candidates),
+		}); err != nil {
+			rlog.Error("failed to record race-lost exception", "err", err, "tx_id", deposit.TxID)
+		}
 		rlog.Warn("best match already claimed",
 			"order_id", best.ID, "deposit_tx", deposit.TxID)
 		return nil
 	}
 
+	if err := s.repo.MarkDepositMatched(ctx, deposit.TxID, best.ID); err != nil {
+		rlog.Warn("failed to flag deposit as matched", "err", err, "tx_id", deposit.TxID)
+	}
 	rlog.Info("matched deposit to order",
 		"order_id", best.ID, "amount", deposit.Amt, "tx_id", deposit.TxID)
 	return nil
+}
+
+func toExceptionCandidates(txs []*domain.Transaction) []domain.ExceptionCandidate {
+	out := make([]domain.ExceptionCandidate, 0, len(txs))
+	for _, tx := range txs {
+		out = append(out, domain.ExceptionCandidate{
+			ID:        tx.ID,
+			Amount:    tx.Amount,
+			CreatedAt: tx.CreatedAt,
+		})
+	}
+	return out
 }
 
 func (s *Service) runDepositListener() {
@@ -189,37 +246,56 @@ func (s *Service) runDepositListener() {
 	}
 }
 
-// dedupAmount keeps amounts unique among pending orders. NOTE: still has
-// SELECT-then-INSERT race (trace error.md C1).
+// dedupAmount perturbs base by a small offset so a pending order's
+// (currency, amount) is likely unique. The unique partial index
+// transactions_pending_amount_uidx is the authoritative guard; Checkout retries
+// CreateTransaction on the rare residual collision.
 func (s *Service) dedupAmount(ctx context.Context, ccy string, base decimal.Decimal) (decimal.Decimal, error) {
-	const maxRetries = 10
-	amount := base
-	for i := 0; i < maxRetries; i++ {
-		exists, err := s.repo.HasPendingAmount(ctx, ccy, amount)
-		if err != nil {
-			return decimal.Zero, err
-		}
-		if !exists {
-			return amount, nil
-		}
-		if i == maxRetries-1 {
-			return decimal.Zero, errors.New("system busy, please try again later")
-		}
-		b := make([]byte, 2)
-		if _, err := rand.Read(b); err != nil {
-			return decimal.Zero, err
-		}
-		val := uint16(b[0])<<8 | uint16(b[1])
-		offset := decimal.New(int64((val%999)+1), -4) // offsetInt × 10^-4, exact
-		amount = base.Add(offset).Round(4)
+	exists, err := s.repo.HasPendingAmount(ctx, ccy, base)
+	if err != nil {
+		return decimal.Zero, err
 	}
-	return amount, nil
+	if !exists {
+		return base, nil
+	}
+	offset, err := randomAmountOffset()
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return base.Add(offset).Round(4), nil
+}
+
+func randomAmountOffset() (decimal.Decimal, error) {
+	b := make([]byte, 2)
+	if _, err := rand.Read(b); err != nil {
+		return decimal.Zero, err
+	}
+	val := uint16(b[0])<<8 | uint16(b[1])
+	return decimal.New(int64((val%999)+1), -4), nil // [0.0001, 0.0999]
 }
 
 func generateOrderID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func (s *Service) ExpirePendingOrders(ctx context.Context) (int64, error) {
+	return s.repo.ExpirePendingOrders(ctx, matcher.Default().TimeWindow)
+}
+
+//encore:api private method=GET path=/payment/exceptions
+func (s *Service) ListExceptions(ctx context.Context) (*ListExceptionsResponse, error) {
+	excs, err := s.repo.ListOpenExceptions(ctx, 100)
+	if err != nil {
+		return nil, err
+	}
+	return &ListExceptionsResponse{Exceptions: excs}, nil
+}
+
+//encore:api private method=POST path=/payment/exceptions/resolve
+func (s *Service) ResolveException(ctx context.Context, req *ResolveExceptionRequest) error {
+	return s.repo.ResolveMatchException(ctx, req.ID, req.Resolution)
 }
 
 var _ = cron.NewJob("sync-okx-currencies", cron.JobConfig{
@@ -231,4 +307,22 @@ var _ = cron.NewJob("sync-okx-currencies", cron.JobConfig{
 //encore:api private
 func syncOKXCurrenciesCron(ctx context.Context) error {
 	return svc.SyncCurrencies(ctx)
+}
+
+var _ = cron.NewJob("expire-pending-orders", cron.JobConfig{
+	Title:    "Expire pending orders past the match window",
+	Endpoint: expirePendingOrdersCron,
+	Every:    1 * cron.Hour,
+})
+
+//encore:api private
+func expirePendingOrdersCron(ctx context.Context) error {
+	n, err := svc.ExpirePendingOrders(ctx)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		rlog.Info("expired pending orders", "count", n)
+	}
+	return nil
 }
